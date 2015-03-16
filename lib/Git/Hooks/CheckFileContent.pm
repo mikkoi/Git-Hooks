@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
 
 package Git::Hooks::CheckFileContent;
-# ABSTRACT: Git::Hooks plugin to enforce commit log policies
+# ABSTRACT: Git::Hooks plugin to enforce file content issues.
 
 use 5.010;
 use utf8;
