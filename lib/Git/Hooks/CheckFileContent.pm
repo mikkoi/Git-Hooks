@@ -10,9 +10,38 @@ use warnings;
 use Git::Hooks qw/:DEFAULT :utils/;
 use Git::More::Message;
 use List::MoreUtils qw/uniq/;
+use Data::Dumper;
 
 my $PKG = __PACKAGE__;
 (my $CFG = __PACKAGE__) =~ s/.*::/githooks./;
+
+# [githooks]
+#     debug = 0
+#     plugin = CheckLog
+#     plugin = CheckFile
+#     plugin = CheckFileContent
+#     help-on-error = "Push failed. Please consult error messages."
+# [githooks "checkfilecontent"]
+#     id = perlpackage
+#     perlpackage.recognize-by = filename || content
+#     perlpackage.by-filename = *.p[m]
+#     perlpackage.empty-lines-at-top = 1
+#     perlpackage.empty-lines-at-bottom = 2
+#     perlpackage.indent-character = tab
+#     perlpackage.mixing-tab-and-space-allowed = 0
+#     perlpackage.whitespace-before-eol-allowed = 0
+#     perlpackage.indent-width = 4
+#     perlpackage.indent-multiplier-check = 1
+#     id = perlexe
+#     perlexe.recognize-by = content && permissions
+#     perlexe.by-content = "^#!/usr/bin/env perl$"
+#     perlexe.by-permissions = x
+#     perlexe.empty-lines-at-top = 0
+#     perlexe.indent-character = space
+#     id = perlexe2
+#     perlexe2.recognize-by = permissions
+#     perlexe2.by-permissions = x
+#     perlexe2.indent-character = space
 
 #############
 # Grok hook configuration, check it and set defaults.
@@ -22,6 +51,7 @@ sub _setup_config {
 
     my $config = $git->get_config();
 
+    print Dumper($config);
     $config->{lc $CFG} //= {};
 
     my $default = $config->{lc $CFG};
