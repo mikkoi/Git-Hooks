@@ -8,6 +8,9 @@ use utf8;
 use strict;
 use warnings;
 use Git::Hooks qw/:DEFAULT :utils/;
+use Data::Util qw(:check);
+use Text::Glob qw/glob_to_regex/;
+use Path::Tiny;
 use Git::More::Message;
 use List::MoreUtils qw/uniq/;
 use Data::Dumper;
@@ -17,8 +20,6 @@ my $PKG = __PACKAGE__;
 
 # [githooks]
 #     debug = 0
-#     plugin = CheckLog
-#     plugin = CheckFile
 #     plugin = CheckFileContent
 #     help-on-error = "Push failed. Please consult error messages."
 # [githooks "checkfilecontent"]
@@ -65,61 +66,68 @@ sub _setup_config {
 
 ##########
 
-# Return a Text::SpellChecker object or undef.
+sub check_new_files { # TODO -> check_files!
+    my ($git, $commit, @files) = @_;
 
-sub _spell_checker {
-    my ($git, $msg) = @_;
+    return 1 unless @files;     # No new file to check
 
-    my %extra_options;
-
-    if (my $lang = $git->get_config($CFG => 'spelling-lang')) {
-        $extra_options{lang} = $lang;
+    # First we construct a list of checks from the
+    # githooks.checkfile.basename configuration. Each check in the list is a
+    # pair containing a regex and a command specification.
+    my @checks;
+    foreach my $check ($git->get_config($CFG => 'name')) {
+        my ($pattern, $command) = split / /, $check, 2;
+        if ($pattern =~ m/^qr(.)(.*)\g{1}/) {
+            $pattern = qr/$2/;
+        } else {
+            $pattern = glob_to_regex($pattern);
+        }
+        $command .= ' {}' unless $command =~ /\{\}/;
+        push @checks, [$pattern => $command];
     }
 
-    unless (state $tried_to_check) {
-        unless (eval { require Text::SpellChecker; }) {
-            $git->error($PKG, "could not require Text::SpellChecker module to spell messages", $@);
-            return;
-        }
-
-        # Text::SpellChecker uses either Text::Hunspell or
-        # Text::Aspell to perform the checks. But it doesn't try to
-        # load those modules until we invoke its next_word method. So,
-        # in order to detect errors in those modules we first create a
-        # bogus Text::SpellChecker object and force it to spell a word
-        # to see if it can go so far.
-
-        my $checker = Text::SpellChecker->new(text => 'a', %extra_options);
-
-        my $word = eval { $checker->next_word(); };
-        length $@
-            and $git->error($PKG, "cannot spell check using Text::SpellChecker", $@)
-                and return;
-
-        $tried_to_check = 1;
-    };
-
-    return Text::SpellChecker->new(text => $msg, %extra_options);
-}
-
-sub check_spelling {
-    my ($git, $id, $msg) = @_;
-
-    return 1 unless $msg;
-
-    return 1 unless $git->get_config($CFG => 'spelling');
-
-    # Check all words comprised of at least three Unicode letters
-    my $checker = _spell_checker($git, join("\n", uniq($msg =~ /\b(\p{Cased_Letter}{3,})\b/gi)))
-        or return 0;
-
+    # Now we iterate through every new file and apply to them the matching
+    # commands.
     my $errors = 0;
 
-    foreach my $badword ($checker->next_word()) {
-        my @suggestions = $checker->suggestions($badword);
-        $git->error($PKG, "commit $id log has a misspelled word: '$badword'",
-                    defined $suggestions[0] ? "suggestions: " . join(', ', @suggestions) : undef,
-                );
+    foreach my $file (@files) {
+        my $basename = path($file)->basename;
+        foreach my $command (map {$_->[1]} grep {$basename =~ $_->[0]} @checks) {
+            my $tmpfile = $git->blob($commit, $file)
+                or ++$errors
+                    and next;
+
+            # interpolate filename in $command
+            (my $cmd = $command) =~ s/\{\}/\'$tmpfile\'/g;
+
+            # execute command and update $errors
+            my $saved_output = redirect_output();
+            my $exit = system $cmd;
+            my $output = restore_output($saved_output);
+            if ($exit != 0) {
+                $command =~ s/\{\}/\'$file\'/g;
+                my $message = do {
+                    if ($exit == -1) {
+                        "command '$command' could not be executed: $!";
+                    } elsif ($exit & 127) {
+                        sprintf("command '%s' was killed by signal %d, %s coredump",
+                                $command, ($exit & 127), ($exit & 128) ? 'with' : 'without');
+                    } else {
+                        sprintf("command '%s' failed with exit code %d", $command, $exit >> 8);
+                    }
+                };
+
+                # Replace any instance of the $tmpfile name in the output by
+                # $file to avoid confounding the user.
+                $output =~ s/\Q$tmpfile\E/$file/g;
+
+                $git->error($PKG, $message, $output);
+                ++$errors;
+            } else {
+                # FIXME: What we should do with eventual output from a
+                # successful command?
+            }
+        }
     }
 
     return $errors == 0;
@@ -206,87 +214,38 @@ sub check_body {
     return 1;
 }
 
-sub check_message {
-    my ($git, $commit, $msg) = @_;
-
-    # assert(defined $msg)
-
-    my $id = defined $commit ? substr($commit->{commit}, 0, 7) : '';
-
-    my $errors = 0;
-
-    check_spelling($git, $id, $msg) or ++$errors;
-
-    check_patterns($git, $id, $msg) or ++$errors;
-
-    my $cmsg = Git::More::Message->new($msg);
-
-    check_title($git, $id, $cmsg->title) or ++$errors;
-
-    check_body($git, $id, $cmsg->body) or ++$errors;
-
-    return $errors == 0;
-}
-
-sub check_patchset {
-    my ($git, $opts) = @_;
-
-    _setup_config($git);
-
-    my $sha1   = $opts->{'--commit'};
-    my $commit = $git->get_commit($sha1);
-
-    return check_message($git, $commit, $commit->{body});
-}
-
-sub check_message_file {
-    my ($git, $commit_msg_file) = @_;
-
-    _setup_config($git);
-
-    my $msg = eval {$git->read_commit_msg_file($commit_msg_file)};
-
-    unless (defined $msg) {
-        $git->error($PKG, "cannot read commit message file '$commit_msg_file'", $@);
-        return 0;
-    }
-
-    return check_message($git, undef, $msg);
-}
-
-sub check_ref {
-    my ($git, $ref) = @_;
-
-    my $errors = 0;
-
-    foreach my $commit ($git->get_affected_ref_commits($ref)) {
-        check_message($git, $commit, $commit->{body})
-            or ++$errors;
-    }
-
-    return $errors == 0;
-}
-
-# This routine can act both as an update or a pre-receive hook.
 sub check_affected_refs {
     my ($git) = @_;
-
-    _setup_config($git);
 
     return 1 if im_admin($git);
 
     my $errors = 0;
 
     foreach my $ref ($git->get_affected_refs()) {
-        check_ref($git, $ref)
+        my ($old_commit, $new_commit) = $git->get_affected_ref_range($ref);
+        check_new_files($git, $new_commit, $git->filter_files_in_range('AM', $old_commit, $new_commit))
             or ++$errors;
     }
 
     return $errors == 0;
 }
 
+sub check_commit {
+    my ($git) = @_;
+
+    return check_new_files($git, ':0', $git->filter_files_in_index('AM'));
+}
+
+sub check_patchset {
+    my ($git, $opts) = @_;
+
+    return 1 if im_admin($git);
+
+    return check_new_files($git, $opts->{'--commit'}, $git->filter_files_in_commit('AM', $opts->{'--commit'}));
+}
+
 # Install hooks
-COMMIT_MSG       \&check_message_file;
+PRE_COMMIT       \&check_commit;
 UPDATE           \&check_affected_refs;
 PRE_RECEIVE      \&check_affected_refs;
 REF_UPDATE       \&check_affected_refs;
@@ -294,10 +253,9 @@ PATCHSET_CREATED \&check_patchset;
 DRAFT_PUBLISHED  \&check_patchset;
 
 1;
-
 
 __END__
-=for Pod::Coverage check_spelling check_patterns check_title check_body check_message check_ref
+=for Pod::Coverage check_new_files check_affected_refs check_commit check_patchset
 
 =head1 NAME
 
